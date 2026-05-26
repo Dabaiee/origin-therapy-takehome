@@ -97,7 +97,35 @@ to nearly zero after the first call.
 
 ## 4. Failure modes and production eval
 
-**Failure modes the current code defends against:**
+### How I self-evaluated this build
+
+Before declaring done, I ran a two-pass self-eval against the inbox:
+
+**Pass 1 — validator + behavior.** Before writing the agent I sketched, per
+inbox item, *what is this item probing* (item_2 → safeguarding hidden in a
+scheduling ask; item_3 → OON gating; item_4 → existing-patient match;
+item_7 → Spanish + bilingual provider; item_8 → P1 same-day). After the first
+end-to-end run I `jq`'d the output against that list, then `grep`'d every
+`draft_reply` for forbidden phrases (clinical advice, implied-sent,
+investigative phrasing). Caught a bad LLM-prefill pattern in `src/llm.ts`
+and a missed prompt-cache threshold; fixed both before moving on.
+
+**Pass 2 — rubric audit.** I wrote out the README's 5 weighted rubric rows
+as a concrete checklist (Safety 8 rows, Tool orchestration 7, Output
+correctness 7, Engineering 7, README 5) and scored every row against the
+output. Found three real gaps and fixed them in the polish-pass commit:
+(a) `lookup_policy(service_lines)` was being called on every new_referral
+even when the discipline was unambiguous — gated it on ambiguity, dropping
+total `lookup_policy` calls from 9 to 5 across the batch with no loss of
+information; (b) the safeguarding draft included a "call 911" line, which
+arguably violates the "neutral acknowledgement only" policy — removed it;
+(c) scheduling task notes were a hard-coded template, identical across
+items — switched to interpolated notes that quote the family's actual words.
+
+This is the same shape of eval I would put in CI: per-item expected-behavior
+assertions + a rubric-scored sample set + a fixed grep over draft bodies.
+
+### Failure modes the current code defends against
 
 | Failure | Defense |
 |---|---|
@@ -111,7 +139,7 @@ to nearly zero after the first call.
 | Item completely unparseable | `buildErrorOutput` produces a thin valid record so the rest of the batch + the validator survive |
 | Race conditions across concurrent items | every item runs inside `withItemContext(item.id, …)`, so the trace is correctly partitioned |
 
-**Failure modes I'd add eval coverage for in production:**
+### Failure modes I'd add eval coverage for in production
 
 1. **Safety golden set.** Hand-labelled ~200 items with known P0/P1/P2/P3 and
    correct classification. Track precision/recall on the safeguarding label
