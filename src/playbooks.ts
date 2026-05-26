@@ -147,9 +147,16 @@ async function clinicalQuestionPlaybook(
     "Thank you for reaching out. Our front desk cannot offer clinical opinions over message, but our intake team can set up a brief screening or evaluation to take a closer look. A staff member will follow up to walk you through next steps.",
   );
 
+  // For a clinical question with no intake intent, payer/member_id are not
+  // "missing" — the parent never tried to provide them. Filter to only fields
+  // that actually block the next action (screening/evaluation offer).
+  const filtered = ctx.missing_info.filter(
+    (field) => field !== "payer" && field !== "member_id",
+  );
+
   return {
     task_ids: ctx.task_ids,
-    missing_info: ctx.missing_info,
+    missing_info: filtered,
     recommended_next_action:
       "Intake should call or message the family to offer a screening/evaluation. Do not provide clinical advice in writing.",
     draft_reply: draft,

@@ -11,9 +11,13 @@ npm install
 cp .env.example .env       # paste ANTHROPIC_API_KEY=... into .env
 npm run triage             # writes output.json + .trace/tool-calls.jsonl
 npm run validate           # asserts output.json matches the schema and trace
-npm test                   # 13 unit tests on the safety-critical paths
+npm run eval               # per-item expected-behavior assertions on output.json
+npm test                   # 17 unit + integration tests on the safety-critical paths
 npm run typecheck          # strict tsc, no emit
 ```
+
+The `eval` script is what the README's "20 minutes self-evaluating against the
+validator and the inbox" phase produced — see section 4 for the methodology.
 
 Flags are optional and default to `--input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl`.
 
