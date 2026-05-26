@@ -235,7 +235,10 @@ async function schedulingPlaybook(
 async function existingPatientPlaybook(
   ctx: PlaybookContext,
 ): Promise<PlaybookOutcome> {
-  await tryPatientMatch(ctx);
+  const patient = await tryPatientMatch(ctx);
+  if (patient && isGuardianMismatch(ctx, patient.guardian_name)) {
+    return await guardianMismatchPath(ctx, patient.guardian_name);
+  }
   const task = await create_task({
     assignee: "front_desk",
     title: `Existing-patient request from ${ctx.item.sender}`,
@@ -278,6 +281,11 @@ async function newReferralPlaybook(
 
   // Patient search (in case the "new" referral is actually a re-referral).
   const patient = await tryPatientMatch(ctx);
+  const guardianMismatch =
+    patient !== null && isGuardianMismatch(ctx, patient.guardian_name);
+  if (guardianMismatch && patient) {
+    return await guardianMismatchPath(ctx, patient.guardian_name);
+  }
 
   // Insurance verification — gates whether we can hold a slot.
   const payer = ctx.extraction.extracted_intake.payer || undefined;
@@ -377,6 +385,66 @@ async function oonReferralPath(
   };
 }
 
+// ---------------- Guardian-of-record mismatch (identity gate) ----------------
+//
+// Triggered when search_patient returns a match whose guardian_name does not
+// overlap the claimed sender. We MUST NOT: hold a slot bound to the on-file
+// patient_id, draft a chart-aware reply, or otherwise treat the sender as the
+// verified guardian. We route to intake for an out-of-band identity check.
+
+async function guardianMismatchPath(
+  ctx: PlaybookContext,
+  onFileGuardian: string,
+): Promise<PlaybookOutcome> {
+  const claimed =
+    ctx.extraction.extracted_intake.parent_contact ||
+    ctx.item.sender ||
+    "(unknown sender)";
+  const childName =
+    ctx.extraction.extracted_intake.child_name || "(unnamed child)";
+
+  const task = await create_task({
+    assignee: "intake",
+    title: `Identity verification required for ${childName} (${ctx.item.id})`,
+    due: nextBusinessDayDue(ctx.item),
+    notes: `Inbox sender claims to be the parent/guardian of ${childName} but does not match the guardian-of-record on file (${onFileGuardian}). Do NOT confirm any chart details, hold a slot under the existing patient record, or send a personalized acknowledgement until intake has verified the sender's identity by phone using information not present in this message. Sender as claimed: "${claimed}".`,
+  });
+  ctx.task_ids.push(task.data.task_id);
+
+  // Neutral, no-chart-leakage draft. Do not name the child or reference any
+  // record — the recipient may not be authorized to receive that information.
+  // The LLM's pre-baked draft (extraction.draft_body) was generated before
+  // this safety check ran and may name the child or quote insurance details,
+  // so we MUST bypass produceDraft and write the safe body directly — same
+  // pattern as the safeguarding playbook.
+  const safeBody =
+    ctx.extraction.draft_language === "es"
+      ? "Gracias por su mensaje. Antes de poder hablar sobre detalles específicos, nuestro equipo de admisiones necesita verificar algunos datos por teléfono. Un miembro del equipo se comunicará con usted pronto."
+      : "Thank you for reaching out. Before we can discuss any specifics, our intake team will need to verify a few details by phone. A team member will call you shortly using the contact information you provided.";
+  const recipient = bestRecipient(ctx);
+  if (recipient) {
+    await draft_message({
+      recipient,
+      channel: preferredReplyChannel(ctx.item),
+      body: safeBody,
+      language: ctx.extraction.draft_language,
+    });
+  }
+  const draft = recipient ? safeBody : null;
+
+  return {
+    task_ids: ctx.task_ids,
+    missing_info: ctx.missing_info,
+    recommended_next_action:
+      "Intake to phone-verify the sender's identity against the guardian-of-record before any chart access, slot hold, or personalized reply.",
+    draft_reply: draft,
+    decision_extras: [
+      ...ctx.decision.rationale_overrides,
+      `Guardian-of-record on file (${onFileGuardian}) does not match the inbox sender's claimed name; routed for identity verification before any chart-bound action.`,
+    ],
+  };
+}
+
 // ---------------- Billing question ----------------
 
 async function billingQuestionPlaybook(
@@ -443,6 +511,7 @@ async function fallbackPlaybook(
 
 async function tryPatientMatch(ctx: PlaybookContext): Promise<{
   patient_id: string;
+  guardian_name: string;
 } | null> {
   const name = ctx.extraction.extracted_intake.child_name;
   const dob = ctx.extraction.extracted_intake.dob_or_age;
@@ -452,9 +521,68 @@ async function tryPatientMatch(ctx: PlaybookContext): Promise<{
     dob: dob && /^\d{4}-\d{2}-\d{2}$/.test(dob) ? dob : undefined,
   });
   if (result.data.length > 0) {
-    return { patient_id: result.data[0].patient_id };
+    const match = result.data[0];
+    return {
+      patient_id: match.patient_id,
+      guardian_name: match.guardian_name,
+    };
   }
   return null;
+}
+
+// Identity-verification guard: when search_patient returns a match, the
+// guardian-of-record may not be the same adult who sent this inbox item
+// (custody dispute, ex-partner, impersonation, plain typo). We compare the
+// claimed sender name against the on-file guardian by tokenized overlap:
+// at least two shared name tokens (first + last) ⇒ match. Otherwise the
+// playbook must NOT bind to the on-file patient_id, hold a slot, or send a
+// chart-aware draft — route to intake for identity verification instead.
+function claimedSenderTokens(ctx: PlaybookContext): string[] {
+  const raw =
+    ctx.extraction.extracted_intake.parent_contact || ctx.item.sender || "";
+  const beforeComma = raw.split(",")[0] || "";
+  const beforeAngle = beforeComma.split("<")[0] || beforeComma;
+  return nameTokens(beforeAngle);
+}
+
+function nameTokens(s: string): string[] {
+  return s
+    .toLowerCase()
+    .replace(/[^a-zà-ÿñ\s]/gi, " ")
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length > 1 && !STOP_NAME_TOKENS.has(t));
+}
+
+const STOP_NAME_TOKENS = new Set([
+  "jr",
+  "sr",
+  "ii",
+  "iii",
+  "iv",
+  "mr",
+  "mrs",
+  "ms",
+  "dr",
+  "the",
+  "and",
+  "via",
+  "from",
+  "voicemail",
+  "fax",
+  "portal",
+  "parent",
+]);
+
+function isGuardianMismatch(
+  ctx: PlaybookContext,
+  onFileGuardian: string,
+): boolean {
+  const claimed = new Set(claimedSenderTokens(ctx));
+  const onFile = nameTokens(onFileGuardian);
+  if (claimed.size === 0 || onFile.length === 0) return false; // insufficient signal
+  const shared = onFile.filter((t) => claimed.has(t)).length;
+  return shared < 2;
 }
 
 async function produceDraft(
