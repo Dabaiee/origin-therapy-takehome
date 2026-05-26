@@ -201,8 +201,7 @@ async function schedulingPlaybook(
         }`
       : `Scheduling request from ${ctx.item.sender}`,
     due: sameDayDue(ctx.item),
-    notes:
-      "Call family to confirm reschedule preference. Check provider availability and offer next openings; do NOT auto-schedule.",
+    notes: buildSchedulingTaskNotes(ctx),
   });
   ctx.task_ids.push(task.data.task_id);
 
@@ -259,7 +258,16 @@ async function existingPatientPlaybook(
 async function newReferralPlaybook(
   ctx: PlaybookContext,
 ): Promise<PlaybookOutcome> {
-  await lookup_policy({ topic: "service_lines" });
+  // Only call lookup_policy(service_lines) when discipline is ambiguous,
+  // missing, or possibly outside our supported set (SLP/OT/PT). For an
+  // unambiguous SLP/OT/PT request, the policy snippet would not change the
+  // decision — this avoids performative tool calls.
+  const disciplines = ctx.extraction.extracted_intake.discipline;
+  const disciplineAmbiguous =
+    !disciplines || disciplines.length === 0 || disciplines.length > 1;
+  if (disciplineAmbiguous) {
+    await lookup_policy({ topic: "service_lines" });
+  }
 
   // Patient search (in case the "new" referral is actually a re-referral).
   const patient = await tryPatientMatch(ctx);
@@ -279,7 +287,6 @@ async function newReferralPlaybook(
   }
 
   // In-network or unknown but otherwise OK — propose a slot for human review.
-  const disciplines = ctx.extraction.extracted_intake.discipline;
   const primaryDiscipline = disciplines?.[0];
   let slot: Slot | null = null;
   if (primaryDiscipline) {
@@ -503,14 +510,50 @@ function neutralAcknowledgement(
   language: "en" | "es",
   childName: string | null,
 ): string {
+  // Strictly neutral. Per policy ("do not provide investigative advice in an
+  // outbound message; draft only a neutral acknowledgement"), no instructions
+  // — not even safety referrals like "call 911". The clinical lead decides
+  // whether and how to escalate further.
   if (language === "es") {
     return childName
-      ? `Hola, gracias por su mensaje sobre ${childName}. Hemos compartido esto con nuestra líder clínica, quien se comunicará con usted pronto. Si necesita ayuda inmediata, por favor llame al 911.`
-      : "Hola, gracias por su mensaje. Hemos compartido esto con nuestra líder clínica, quien se comunicará con usted pronto. Si necesita ayuda inmediata, por favor llame al 911.";
+      ? `Hola, gracias por su mensaje sobre ${childName}. Hemos compartido esto con nuestra líder clínica, quien se comunicará con usted pronto.`
+      : "Hola, gracias por su mensaje. Hemos compartido esto con nuestra líder clínica, quien se comunicará con usted pronto.";
   }
   return childName
-    ? `Hello, thank you for reaching out about ${childName}. We've shared your message with our clinical lead, who will follow up with you shortly. If you need immediate help, please call 911.`
-    : "Hello, thank you for reaching out. We've shared your message with our clinical lead, who will follow up with you shortly. If you need immediate help, please call 911.";
+    ? `Hello, thank you for reaching out about ${childName}. We've shared your message with our clinical lead, who will follow up with you shortly.`
+    : "Hello, thank you for reaching out. We've shared your message with our clinical lead, who will follow up with you shortly.";
+}
+
+function buildSchedulingTaskNotes(ctx: PlaybookContext): string {
+  const parts: string[] = [];
+  const name = ctx.extraction.extracted_intake.child_name;
+  const discipline = ctx.extraction.extracted_intake.discipline?.[0];
+
+  if (ctx.extraction.signals.same_day_op) {
+    parts.push(
+      `${name || "Patient"} needs a same-day reschedule of today's ${
+        discipline ? `${discipline} ` : ""
+      }appointment.`,
+    );
+  } else {
+    parts.push(
+      `${name || "Family"} sent a scheduling request${
+        discipline ? ` for ${discipline}` : ""
+      }.`,
+    );
+  }
+
+  // Surface any contextual hint that influenced the urgency (illness, etc.)
+  // so the front desk knows whether to call vs message.
+  const bodySnippet = ctx.item.body.slice(0, 240).replace(/\s+/g, " ").trim();
+  if (bodySnippet) {
+    parts.push(`Family's words: "${bodySnippet}".`);
+  }
+
+  parts.push(
+    "Call family to confirm preferred reschedule time and provider availability; do NOT auto-schedule.",
+  );
+  return parts.join(" ");
 }
 
 function buildIntakeTaskNotes(
