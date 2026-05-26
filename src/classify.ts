@@ -21,9 +21,10 @@ export function decide(item: InboxItem, extraction: Extraction): Decision {
   let classification = extraction.classification;
   let urgency = extraction.urgency_suggestion;
 
-  const regexSafeguarding =
-    TIGHT_SAFEGUARDING.test(item.body) &&
-    !NEGATIVE_SAFEGUARDING.test(item.body);
+  const regexMatch = TIGHT_SAFEGUARDING.exec(item.body);
+  const isNegativeContext = NEGATIVE_SAFEGUARDING.test(item.body);
+  const regexSafeguarding = regexMatch !== null && !isNegativeContext;
+  const triggerPhrase = regexMatch?.[0] ?? null;
 
   // Safety overlay: escalate to P0 ONLY when LLM AND regex agree. This guards
   // both directions — LLM false negative (missed signal) AND LLM false positive
@@ -111,7 +112,12 @@ export function decide(item: InboxItem, extraction: Extraction): Decision {
   const escalation =
     urgency === "P0" || classification === "safeguarding"
       ? {
-          reason: buildEscalationReason(item, extraction, classification),
+          reason: buildEscalationReason(
+            item,
+            extraction,
+            classification,
+            triggerPhrase,
+          ),
           severity:
             (urgency === "P0" ? "P0" : "P1") as "P0" | "P1",
         }
@@ -131,9 +137,28 @@ function buildEscalationReason(
   item: InboxItem,
   extraction: Extraction,
   classification: Classification,
+  triggerPhrase: string | null,
 ): string {
   if (classification === "safeguarding") {
-    return `Possible safeguarding disclosure in ${item.channel} from ${item.sender}. Clinical lead must review within the hour; do not respond to the family with anything beyond a neutral acknowledgement.`;
+    // Quote the exact substring that drove the safeguarding decision. The
+    // clinical lead needs the family's own words to review without re-reading
+    // the entire item, and the quoted phrase makes the decision auditable
+    // ("this is why we flagged it"). Falls back to the LLM's reasoning when
+    // the regex didn't fire — in that case the LLM-only signal was the
+    // trigger.
+    const evidence =
+      triggerPhrase ||
+      extractEvidenceFromLLMReasoning(extraction.reasoning) ||
+      "(see item body)";
+    return `Possible safeguarding disclosure in ${item.channel} from ${item.sender}. Trigger: "${evidence}". Clinical lead must review within the hour; do not respond to the family with anything beyond a neutral acknowledgement.`;
   }
   return `Urgent triage issue on ${item.id}: ${extraction.reasoning}`;
+}
+
+// Pull the first quoted span out of the LLM's reasoning (if any). The
+// extractor's prompt encourages the LLM to quote the family in its reasoning,
+// so this is usually present when the regex missed but the LLM caught it.
+function extractEvidenceFromLLMReasoning(reasoning: string): string | null {
+  const match = reasoning.match(/['"]([^'"]{4,160})['"]/);
+  return match ? match[1] : null;
 }
