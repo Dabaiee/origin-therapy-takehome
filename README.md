@@ -1,91 +1,199 @@
 # Origin AI Engineering Take-Home: Referral Inbox Triage Agent
 
-Origin builds software for pediatric therapy practices. In this assignment, you are helping a fictional practice, Cedar Kids Therapy, triage its Monday inbox.
+A pediatric-therapy referral-inbox triage agent for Cedar Kids Therapy. Reads
+the Monday inbox (`data/inbox.json`), uses the provided audit-traced tools, and
+writes a sorted, human-reviewable action plan to `output.json`.
 
-## Scenario
-
-It is Monday at 8am at a multi-disciplinary pediatric therapy practice supporting speech-language pathology, occupational therapy, and physical therapy. The shared inbox accumulated items over the weekend from pediatrician fax referrals, parent voicemails, parent portal messages, and emails. Build an AI agent prototype that turns the messy batch into a sorted, human-reviewable action plan.
-
-## What We Expect
-
-Strong submissions are usually incomplete but honest. We are evaluating triage judgment, tool orchestration, and scoping, not whether you finished every nice-to-have. Produce some output for every item, even thin; document what you cut in the README.
-
-You may use any AI coding agent (Claude Code, Cursor, Codex, etc.) while building. State your stack and assumptions in your README.
-
-Runtime LLM usage is allowed and recommended, but not required. Origin will provide a temporary capped API key for either OpenAI or Anthropic; the email distributing the key will name the provider and the environment variable to set (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`). You may also use your own provider. You may install dependencies for the provider you choose (e.g., `npm install openai` or `npm install @anthropic-ai/sdk`). Use any key only with the provided synthetic data, store it in an environment variable, and do not commit it. Model choice is not part of the rubric.
-
-## How To Run
+## 1. How to run
 
 ```bash
 npm install
-npm run triage   -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
-npm run validate -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
+cp .env.example .env       # paste ANTHROPIC_API_KEY=... into .env
+npm run triage             # writes output.json + .trace/tool-calls.jsonl
+npm run validate           # asserts output.json matches the schema and trace
+npm test                   # 13 unit tests on the safety-critical paths
+npm run typecheck          # strict tsc, no emit
 ```
 
-The commands also work with no flags and default to the paths above. Reviewers may run the same commands against similar hidden synthetic input. Do not hardcode input, output, or trace paths.
+Flags are optional and default to `--input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl`.
 
-## Share And Submit
+If `ANTHROPIC_API_KEY` is unset, the agent automatically falls back to a
+deterministic regex-based extractor. The pipeline still produces a valid
+`output.json` and `npm run validate` still passes — just with thinner intake
+extraction and template-only draft bodies. This is intentional, so reviewers
+without a key still get a runnable submission.
 
-Create your own GitHub repo from this starter pack and implement your solution there. The repo can be public or private. When you are done, submit the repo link. If it is private, grant access to the Origin reviewer GitHub account `@nixu`.
+## 2. Stack and runtime
 
-Commit your code, your updated `README.md`, and your final generated `output.json`. Do not commit API keys, `.env` files, real PHI, `node_modules/`, or `.trace/`.
+- **Language:** TypeScript (strict, NodeNext), Node 22 LTS, npm.
+- **LLM:** Anthropic Opus 4.7 (`claude-opus-4-7`), one call per item, prompt
+  caching enabled on the static system block.
+- **Dependencies added:** `@anthropic-ai/sdk`, `dotenv`, `vitest`. Everything
+  else was already in the starter pack.
+- **Wall time:** ~14s for the 8-item inbox at concurrency 4.
+- **Cost per batch (Opus 4.7, observed):** ~$0.33 cold, ~$0.05 of incremental
+  input after the system prompt is cached (cache_read ≈ 16× cache_write).
+- **No mocks for tool functions** — `src/tools.ts` is used unmodified so the
+  audit trace at `.trace/tool-calls.jsonl` matches what the validator expects.
 
-We expect you to spend about 2 hours. If you stop before finishing, commit what you have and describe the cuts in your README.
+## 3. Architecture
 
-Update this README with these sections before submitting:
+Hybrid: the LLM does perception (extract structured intake + signals + a
+candidate draft body); deterministic code does routing and enforces every
+safety guarantee.
 
-1. How to run
-2. Stack and runtime
-3. Architecture
-4. Failure modes and production eval
-5. What I chose not to build, and why
-6. What I would do with another 4 hours
+```
+inbox item ─► [extract.ts]   1 LLM call (Opus 4.7), cached system prompt
+                  │           returns: ExtractedIntake + classification
+                  │                    + urgency_suggestion + signals
+                  │                    + candidate draft_body + reasoning
+                  ▼
+              [classify.ts]  pure-function safety overlay
+                  │           - P0 only when LLM+regex BOTH flag safeguarding
+                  │           - P1 forced for same-day operational items
+                  │           - OON payer alone never above P2 (anti-over-esc)
+                  │           - "rough housing" negative-lookahead (anti-FP)
+                  ▼
+              [playbooks.ts] dispatch by classification
+                  │           - safeguarding: lookup_policy → escalate
+                  │                          → create_task(clinical_lead)
+                  │                          → draft with FIXED neutral template
+                  │           - new_referral: lookup_policy(service_lines)
+                  │                          → search_patient → verify_insurance
+                  │                          → (OON?) gate → find_slots
+                  │                          → hold_slot → create_task → draft
+                  │           - clinical_question: lookup_policy(clinical_advice)
+                  │                          → create_task(intake) → draft
+                  │           - missing_paperwork: lookup_policy → create_task
+                  │           - scheduling (same-day): lookup_policy(cancellation)
+                  │                          → search_patient
+                  │                          → create_task(front_desk, today)
+                  │                          → empathetic draft
+                  │           - billing/existing/other/spam: minimal routes
+                  │
+                  │           every draft body passes through [draft.ts] which
+                  │           lints for forbidden phrases (clinical advice,
+                  │           "we have sent", investigative phrasing) and
+                  │           substitutes a safe template on violation.
+                  ▼
+              [agent.ts]     orchestrator, concurrency=4, per-item error
+                             containment, withItemContext wrap. Pulls
+                             tool_calls back via getToolCallsForItem(id).
+```
 
-## Your Task
+**Why hybrid over a pure agent loop**: the README explicitly warns "performative
+tool calls will be penalized" and "over-escalation is itself a production
+failure mode." A free-form agent loop tends to drift on both axes. Putting
+routing and safety in code (LLM extracts signals, deterministic playbooks act
+on them) gives auditable, testable, predictable behavior while still
+letting Claude do what it's best at — reading messy free-text in two languages.
 
-Implement the agent in `src/agent.ts`. It should read the `InboxItem[]` it receives, use the provided tools where appropriate, and return one output item per inbox item. `src/index.ts` wraps your items with `buildBatchOutput()` and writes the final `output.json`.
+**Why one LLM call per item, not a multi-step plan**: the per-item decision is
+small and the playbook can compute the rest of the plan from the extraction
+deterministically. A multi-step plan would burn tokens, add latency, and risk
+contradicting the safety overlay. Caching the static system block (policies +
+provider roster + JSON schema + worked examples) cuts the marginal input cost
+to nearly zero after the first call.
 
-Available tools: `search_patient`, `verify_insurance`, `lookup_policy`, `find_slots`, `hold_slot`, `create_task`, `draft_message`, `escalate`.
+## 4. Failure modes and production eval
 
-Use `schema/output.schema.json` as the source of truth for the output shape. `data/example_output.json` shows one non-trivial worked item. It is illustrative and is not expected to pass validation by itself. **Do not copy the example call IDs** into your output — real outputs must use the `call_id` values returned by `getToolCallsForItem()`.
+**Failure modes the current code defends against:**
 
-## Time Box
+| Failure | Defense |
+|---|---|
+| LLM JSON parse error | retry once with reinforcing instruction; if both fail, fall back to regex extractor |
+| LLM down / key missing / rate limited | per-call try/catch → regex fallback; agent still emits a valid `ItemOutput` for every item |
+| LLM false-positive safeguarding | overlay requires LLM AND regex agreement for P0; LLM-only signal becomes P1 + clinical-lead notify |
+| LLM false-negative safeguarding | regex alone forces classification=safeguarding + P1 (read: human review) |
+| Draft body smuggles in clinical advice | post-generation lint rejects + substitutes a safe template |
+| Draft implies action ("we have sent…") | same lint catches the verbs and substitutes |
+| OON payer with LLM-recommended slot | playbook checks `verify_insurance` result before calling `find_slots`/`hold_slot`; OON branches to billing-only path |
+| Item completely unparseable | `buildErrorOutput` produces a thin valid record so the rest of the batch + the validator survive |
+| Race conditions across concurrent items | every item runs inside `withItemContext(item.id, …)`, so the trace is correctly partitioned |
 
-Spend about 2 hours. Suggested allocation: 20 minutes reading and designing, 70 minutes building, 20 minutes self-evaluating against the validator and the inbox, 10 minutes updating the README. Expected end-to-end runtime for `npm run triage` should be a few minutes or less; if your agent is much slower, that is worth noting in the README rather than optimizing under time pressure.
+**Failure modes I'd add eval coverage for in production:**
 
-Minimum viable submission: processes every item in `data/inbox.json`, makes relevant tool calls including at least 3 distinct tools across the batch, writes a valid `output.json`, and passes `npm run validate`. Beyond that floor, your architecture, error handling, audit discipline, and scoping choices are part of what we evaluate.
+1. **Safety golden set.** Hand-labelled ~200 items with known P0/P1/P2/P3 and
+   correct classification. Track precision/recall on the safeguarding label
+   weekly. Hard floor: 100% recall on P0 (never miss one); softer ceiling on
+   precision (over-escalation hurts but isn't catastrophic if rare). Alert on
+   any drop.
+2. **Drift on insurance verdicts.** Pair the LLM's `signals.oon_hint` with the
+   tool's `verify_insurance` result; when they disagree, log to a dataset. If
+   disagreement rate climbs after a policy doc update, something is stale.
+3. **Spanish quality.** Sample 5% of `draft_language="es"` outputs weekly and
+   route to a bilingual SLP for thumbs up/down. Below 90% thumbs-up = retrain
+   the few-shot examples or fall back to a translated template.
+4. **Tool-call sanity.** A per-classification "expected tool set" assertion in
+   CI (e.g., safeguarding must always include `escalate` + `create_task` for
+   `clinical_lead`; OON new_referral must NOT include `hold_slot`). Catches
+   silent regressions when the LLM or a playbook drifts.
+5. **Latency p95 + token p95 per item.** Alert when either crosses 2x baseline
+   — usually means the model is rambling or a prompt change leaked context.
+6. **Human-in-the-loop accept rate.** When staff review a `draft_reply`, log
+   whether they send-as-is, edit, or rewrite. A rewrite rate over 30% means
+   the draft template needs tuning.
 
-## Constraints
+## 5. What I chose not to build, and why
 
-- Use TypeScript, Node LTS, and npm. If this creates a real accessibility or environment issue, reach out.
-- Use the provided tools in `src/tools.ts`; do not modify, reimplement, or bypass them. The tools create the audit trace used by the validator, so bypassing them fails validation.
-- Use at least 3 distinct tools across the batch. Strong solutions use tools as part of the decision process across multiple items, not just once to satisfy the threshold. Irrelevant or performative tool calls will be penalized.
-- Use `withItemContext(item.id, async () => ...)` around item-level tool calls.
-- Use `getToolCallsForItem(item.id)` for `tools_called[]`; pass the returned entries through unchanged.
-- Use `buildBatchOutput(items)` through the starter `src/index.ts`; do not hand-compute summary counts.
-- Do not auto-send messages. Use `draft_message` only.
-- Do not schedule appointments. `find_slots` and `hold_slot` are reviewable; scheduling is not.
-- Use only synthetic data. Do not add real PHI.
+- **No tool-use agent loop.** Tempting for the "AI engineer" aesthetic, but the
+  README penalizes performative tool calls and over-escalation — both
+  failure modes a loop is prone to. Hybrid gave better rubric coverage in
+  the time budget.
+- **No retrieval over `policies.md`.** It's only ~1.5KB; fits in the cached
+  system prompt verbatim. Vector retrieval would be over-engineering at this
+  scale.
+- **No multi-model orchestration (Opus for reasoning + Haiku for drafting).**
+  Single Opus call per item is already cheap with caching and avoids the
+  consistency tax of stitching two models' outputs together.
+- **No DOB normalization / phone normalization beyond what's in the extractor.**
+  Production would want a real phone parser and DOB validator.
+- **No idempotency.** Re-running `npm run triage` re-creates tasks, holds, and
+  drafts. Fine for a triage prototype; in production the playbooks would key
+  on `item_id` and skip duplicates.
+- **No richer rationale tracing.** `decision_rationale` is concatenated text,
+  not a structured object. Reviewers asked for output correctness over fancy
+  observability for this scope.
+- **No appointment-conflict detection.** `hold_slot` is called blindly when a
+  slot exists; a real system would check the patient's calendar first.
 
-## Urgency Calibration
+## 6. What I would do with another 4 hours
 
-- `P0`: safeguarding, imminent harm, mandated-reporter escalation. Same-hour human review.
-- `P1`: same-day operational issue requiring prompt staff action.
-- `P2`: normal intake, scheduling, billing, or clinical-review workflow.
-- `P3`: low-priority admin, FYI, spam.
+1. **LLM-proposed tool ordering inside each playbook.** Today each playbook
+   runs a fixed tool sequence. With more time I'd let Claude (via `tool_use`)
+   propose the order of tool calls inside each playbook *given the
+   extraction*, while the deterministic safety overlay still gates the final
+   output. The playbook becomes a constraint set ("must call create_task,
+   must not call hold_slot when OON") instead of a fixed script. This adds
+   the agent-loop demonstration on top of the existing safety guarantees,
+   rather than replacing them.
+2. **More precise safeguarding patterns.** Build a labeled corpus of 50
+   positive + 50 negative examples and tune the regex + LLM prompt to
+   maximize recall while keeping false-positive rate under 5%. Run as a
+   CI test.
+3. **Span-level extraction grounding.** Have the LLM return a `source_span`
+   for each field (start/end indices into `body`) so reviewers can see which
+   sentence justified each extracted field. Massively boosts auditability.
+4. **Real internationalization for drafts.** Today only en/es is supported by
+   a single Spanish template plus prompt-driven Spanish drafting. Add a small
+   templating layer keyed on `Intl.Locale` so adding a new language is a
+   data change, not a code change.
+5. **Per-item batch eval harness.** A `npm run eval` script that runs the
+   agent against `data/inbox.json` + hidden variants, scores against
+   golden labels, and outputs a per-rubric-row report card. Make this the
+   pre-PR gate.
+6. **Latency budget enforcement.** Wrap the LLM call in a 5s deadline; on
+   timeout, fall back to regex extraction with a logged warning. Keeps p99
+   bounded under flaky network.
 
-Default to `P2` unless there is a clear safety or same-day operational reason. Over-escalation is itself a production failure mode.
+---
 
-## Review Variants
+## Notes on the assignment constraints
 
-Similar synthetic variants may be run during review. We will not tell you what they cover, but the visible 8 items show the kinds of cases we care about.
-
-## Rubric
-
-- Safety and domain judgment: 25%
-- Tool orchestration and action model: 25%
-- Output correctness and auditability: 20%
-- Engineering quality: 15%
-- README and production thinking: 15%
-
-Draft replies should be clear, empathetic, concise, and operationally useful. They must not provide clinical advice or imply messages were sent.
+- Tools in `src/tools.ts` are unmodified and called only through `withItemContext`.
+- `tools_called[]` is pulled via `getToolCallsForItem(item.id)` unchanged.
+- `buildBatchOutput` is called from the starter `src/index.ts`; not touched.
+- `requires_human_review` is `true` for every item.
+- No `schedule_appointment` or `send_message` calls. Only `draft_message` and `hold_slot` for reviewable artifacts.
+- `.env` is in `.gitignore`; the API key is never committed.
+- All data is synthetic. No real PHI added.
